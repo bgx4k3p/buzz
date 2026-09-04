@@ -43,7 +43,7 @@ use pool::{
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -217,7 +217,8 @@ async fn is_owner_or_sibling(
 
 /// Inbound author gate decision: does this author's event fire a turn?
 ///
-/// Coarse security policy applied before subscription rules. Both `OwnerOnly`
+/// Coarse security policy applied before an accepted event reaches the queue or
+/// agent. Both `OwnerOnly`
 /// and `Allowlist` accept the owner and same-owner siblings; `Allowlist`
 /// additionally accepts the explicit external pubkey list.
 ///
@@ -284,6 +285,286 @@ pub(crate) async fn is_dm_channel(
             true
         }
     }
+}
+
+const RECENT_REPLY_PARENT_CAPACITY: usize = 4096;
+const MAX_PENDING_REPLY_LOOKUPS: usize = 8;
+const MAX_PENDING_EVENT_VERIFICATIONS: usize = 8;
+const MAX_RELAY_EVENTS_BEFORE_VALIDATED_REPLY: usize = 32;
+
+#[derive(Debug)]
+struct ValidatedReply {
+    event: relay::BuzzEvent,
+    subscription_generation: Uuid,
+    parent_verified: bool,
+}
+
+fn take_ready_validated_reply_after_budget(
+    relay_events_since_validated_reply: usize,
+    validated_reply_rx: &mut mpsc::Receiver<ValidatedReply>,
+) -> Option<ValidatedReply> {
+    if relay_events_since_validated_reply < MAX_RELAY_EVENTS_BEFORE_VALIDATED_REPLY {
+        return None;
+    }
+    validated_reply_rx.try_recv().ok()
+}
+
+fn validated_reply_generation_is_current(
+    channel_id: Uuid,
+    validated_generation: Option<Uuid>,
+    subscribed_channel_ids: &HashSet<Uuid>,
+    subscription_generations: &HashMap<Uuid, Uuid>,
+) -> bool {
+    subscribed_channel_ids.contains(&channel_id)
+        && validated_generation == subscription_generations.get(&channel_id).copied()
+}
+
+fn classified_ordinary_fallback_is_terminal(
+    validated_generation: Option<Uuid>,
+    parent_verified: bool,
+) -> bool {
+    validated_generation.is_some() && !parent_verified
+}
+
+fn reply_candidate_requires_classification(
+    verified_candidate: Option<&filter::MatchedRule>,
+    ordinary_match: Option<&filter::MatchedRule>,
+    parent_known_other: bool,
+    already_classified: bool,
+) -> bool {
+    if parent_known_other || already_classified {
+        return false;
+    }
+    match (verified_candidate, ordinary_match) {
+        (Some(verified), Some(ordinary)) => verified.rule_index < ordinary.rule_index,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Bounded metadata cache for events already observed on the relay stream.
+///
+/// In mentions mode the relay subscription is intentionally broad enough to
+/// receive direct replies. Remembering recent signed parents lets the hot path
+/// reject replies to other authors without an HTTP query. Cache misses still
+/// use the authoritative REST fallback so replies to pre-restart events work.
+#[derive(Default)]
+struct RecentReplyParents {
+    order: VecDeque<String>,
+    entries: HashMap<String, Uuid>,
+}
+
+impl RecentReplyParents {
+    fn insert_verified(&mut self, event_id: String, channel_id: Uuid) {
+        if self.entries.contains_key(&event_id) {
+            return;
+        }
+        while self.entries.len() >= RECENT_REPLY_PARENT_CAPACITY {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+        self.order.push_back(event_id.clone());
+        self.entries.insert(event_id, channel_id);
+    }
+
+    /// `None` means the parent has not been observed and needs REST fallback.
+    fn is_agent_parent(&self, parent_event_id: &str, channel_id: Uuid) -> Option<bool> {
+        self.entries
+            .get(parent_event_id)
+            .map(|parent_channel| *parent_channel == channel_id)
+    }
+}
+
+async fn verify_event_bounded(event: nostr::Event, permits: Arc<Semaphore>) -> bool {
+    let Ok(permit) = permits.try_acquire_owned() else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        // Keep the permit in the blocking closure. If an async timeout drops
+        // the JoinHandle, the still-running CPU work remains bounded.
+        let _permit = permit;
+        buzz_core::verify_event(&event).is_ok()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn schedule_recent_parent_observation(
+    event: &nostr::Event,
+    channel_id: Uuid,
+    agent_pubkey_hex: &str,
+    cache: Arc<std::sync::Mutex<RecentReplyParents>>,
+    verification_permits: Arc<Semaphore>,
+) {
+    // Broad mentions-mode subscriptions receive ordinary human chatter.
+    // Reject non-agent authors and wrong-channel events before spawning work.
+    if event.pubkey.to_hex() != agent_pubkey_hex || !event_has_channel_tag(event, channel_id) {
+        return;
+    }
+    let Ok(permit) = verification_permits.try_acquire_owned() else {
+        return;
+    };
+    let event = event.clone();
+    tokio::spawn(async move {
+        let event_id = event.id.to_hex();
+        let verified = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            buzz_core::verify_event(&event).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        if verified {
+            if let Ok(mut cache) = cache.lock() {
+                cache.insert_verified(event_id, channel_id);
+            }
+        }
+    });
+}
+
+fn event_has_channel_tag(event: &nostr::Event, channel_id: Uuid) -> bool {
+    let channel_hex = channel_id.to_string();
+    event.tags.iter().any(|tag| {
+        let parts = tag.as_slice();
+        parts.first().map(String::as_str) == Some("h")
+            && parts.get(1).map(String::as_str) == Some(channel_hex.as_str())
+    })
+}
+
+fn direct_reply_parent_id(event: &nostr::Event) -> Option<String> {
+    let parent_hex = queue::parse_thread_tags(event).parent_event_id?;
+    nostr::EventId::from_hex(&parent_hex).ok()?;
+    Some(parent_hex)
+}
+
+/// Return true when the referenced parent was authored by this agent in the
+/// same channel.
+///
+/// Parent lookup is fail-closed: timeout/query failure, a missing parent, a
+/// signature/id mismatch, a different author, or a cross-channel parent all
+/// return false.
+async fn lookup_direct_reply_parent(
+    parent_hex: &str,
+    channel_id: Uuid,
+    agent_pubkey_hex: &str,
+    rest_client: &relay::RestClient,
+    verification_permits: Arc<Semaphore>,
+) -> bool {
+    let Ok(parent_id) = nostr::EventId::from_hex(parent_hex) else {
+        return false;
+    };
+    let filter = nostr::Filter::new().id(parent_id);
+    let response = match tokio::time::timeout(Duration::from_secs(2), rest_client.query(&[filter]))
+        .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            tracing::debug!(parent_event_id = %parent_hex, "reply parent lookup failed: {error}");
+            return false;
+        }
+        Err(_) => {
+            tracing::debug!(parent_event_id = %parent_hex, "reply parent lookup timed out");
+            return false;
+        }
+    };
+    let Some(values) = response.as_array() else {
+        return false;
+    };
+
+    for value in values {
+        let Ok(parent) = serde_json::from_value::<nostr::Event>(value.clone()) else {
+            continue;
+        };
+        if parent.id != parent_id
+            || parent.pubkey.to_hex() != agent_pubkey_hex
+            || !event_has_channel_tag(&parent, channel_id)
+        {
+            continue;
+        }
+        return verify_event_bounded(parent, verification_permits).await;
+    }
+    false
+}
+
+struct ReplyValidationContext {
+    agent_pubkey_hex: String,
+    rest_client: relay::RestClient,
+    channel_info: pool::ChannelInfoResolver,
+    respond_to: RespondTo,
+    allowlist: HashSet<String>,
+    owner_cache: Arc<OwnerCache>,
+    permits: Arc<Semaphore>,
+    verification_permits: Arc<Semaphore>,
+    validated_tx: mpsc::Sender<ValidatedReply>,
+}
+
+fn schedule_direct_reply_validation(
+    event: relay::BuzzEvent,
+    parent_hex: String,
+    parent_verified_from_cache: bool,
+    subscription_generation: Uuid,
+    context: ReplyValidationContext,
+) -> bool {
+    let Ok(permit) = context.permits.try_acquire_owned() else {
+        return false;
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        let channel_id = event.channel_id;
+        let author = event.event.pubkey.to_hex();
+        let validation = async {
+            if !verify_event_bounded(event.event.clone(), context.verification_permits.clone())
+                .await
+                || !event_has_channel_tag(&event.event, channel_id)
+            {
+                return None;
+            }
+            let parent_verified = parent_verified_from_cache
+                || lookup_direct_reply_parent(
+                    &parent_hex,
+                    channel_id,
+                    &context.agent_pubkey_hex,
+                    &context.rest_client,
+                    context.verification_permits.clone(),
+                )
+                .await;
+            let is_dm = is_dm_channel(channel_id, &context.channel_info).await;
+            if !author_allowed(
+                &context.respond_to,
+                &context.allowlist,
+                &author,
+                is_dm,
+                &context.owner_cache,
+                &context.rest_client,
+            )
+            .await
+            {
+                return None;
+            }
+            Some(parent_verified)
+        };
+        match tokio::time::timeout(Duration::from_secs(2), validation).await {
+            Ok(Some(parent_verified)) => {
+                let _ = context
+                    .validated_tx
+                    .send(ValidatedReply {
+                        event,
+                        subscription_generation,
+                        parent_verified,
+                    })
+                    .await;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::debug!(
+                    channel_id = %channel_id,
+                    parent_event_id = %parent_hex,
+                    "reply validation timed out"
+                );
+            }
+        }
+    });
+    true
 }
 
 /// Query an author's kind:0 profile and check if their NIP-OA auth tag
@@ -1441,7 +1722,7 @@ async fn tokio_main() -> Result<()> {
             _ => {} // anyone/nobody don't depend on owner
         }
     }
-    let owner_cache = OwnerCache::new(startup_owner.clone());
+    let owner_cache = Arc::new(OwnerCache::new(startup_owner.clone()));
 
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
@@ -1771,6 +2052,18 @@ async fn tokio_main() -> Result<()> {
         Wake(u32, Result<AgentPool, String>),
     }
 
+    let recent_reply_parents = Arc::new(std::sync::Mutex::new(RecentReplyParents::default()));
+    let (validated_reply_tx, mut validated_reply_rx) =
+        mpsc::channel::<ValidatedReply>(MAX_PENDING_REPLY_LOOKUPS);
+    let reply_lookup_permits = Arc::new(Semaphore::new(MAX_PENDING_REPLY_LOOKUPS));
+    let event_verification_permits = Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS));
+    let mut subscription_generations: HashMap<Uuid, Uuid> = subscribed_channel_ids
+        .iter()
+        .copied()
+        .map(|channel_id| (channel_id, Uuid::new_v4()))
+        .collect();
+    let mut relay_events_since_validated_reply = 0usize;
+
     loop {
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
@@ -1973,10 +2266,42 @@ async fn tokio_main() -> Result<()> {
                     None
                 }
                 // Remaining branches don't touch pool — evaluated when pool is idle.
-                buzz_event = relay.next_event() => {
+                inbound = async {
+                    // Keep relay events (including membership revocations) ahead of
+                    // completed validations within a bounded window, then force one
+                    // ready validation so sustained chatter cannot starve replies.
+                    if let Some(validated) = take_ready_validated_reply_after_budget(
+                        relay_events_since_validated_reply,
+                        &mut validated_reply_rx,
+                    ) {
+                        return Some((
+                            validated.event,
+                            validated.parent_verified,
+                            Some(validated.subscription_generation),
+                        ));
+                    }
+                    tokio::select! {
+                        biased;
+                        // Prioritize relay ordering only within the bounded window.
+                        event = relay.next_event() => event.map(|event| (event, false, None)),
+                        event = validated_reply_rx.recv() => event.map(|validated| {
+                            (
+                                validated.event,
+                                validated.parent_verified,
+                                Some(validated.subscription_generation),
+                            )
+                        }),
+                    }
+                } => {
                     let _ = result_rx; // end split borrow before relay handling
-                    match buzz_event {
-                        Some(buzz_event) => {
+                    match inbound {
+                        Some((buzz_event, direct_reply_verified, validated_generation)) => {
+                            if validated_generation.is_some() {
+                                relay_events_since_validated_reply = 0;
+                            } else {
+                                relay_events_since_validated_reply =
+                                    relay_events_since_validated_reply.saturating_add(1);
+                            }
                             let kind_u32 = buzz_event.event.kind.as_u16() as u32;
 
                             if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
@@ -2030,6 +2355,7 @@ async fn tokio_main() -> Result<()> {
                                     }
                                 }
                                 membership_newest_ts.insert(ch, ts);
+                                subscription_generations.insert(ch, Uuid::new_v4());
 
                                 if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION {
                                     // Clear removal tracking so sessions are not
@@ -2094,6 +2420,29 @@ async fn tokio_main() -> Result<()> {
                                 }
                                 continue;
                             }
+
+                            if validated_generation.is_some()
+                                && !validated_reply_generation_is_current(
+                                    buzz_event.channel_id,
+                                    validated_generation,
+                                    &subscribed_channel_ids,
+                                    &subscription_generations,
+                                )
+                            {
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    "dropping validated reply from an inactive subscription generation"
+                                );
+                                continue;
+                            }
+
+                            schedule_recent_parent_observation(
+                                &buzz_event.event,
+                                buzz_event.channel_id,
+                                &pubkey_hex,
+                                recent_reply_parents.clone(),
+                                event_verification_permits.clone(),
+                            );
 
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
@@ -2203,22 +2552,14 @@ async fn tokio_main() -> Result<()> {
                                 // Not from owner — fall through to normal prompt handling.
                             }
 
-                            // Coarse security policy: drop events from disallowed
-                            // authors before they reach subscription rules or the
-                            // agent. Must be AFTER !shutdown (owner can always
-                            // shut down regardless of gate mode).
-                            //
-                            // Both OwnerOnly and Allowlist accept events from
-                            // "siblings" — pubkeys whose agent_owner_pubkey
-                            // matches this agent's owner (e.g. other bots
-                            // launched by the same human). Allowlist adds the
-                            // explicit pubkey list on top, for external people;
-                            // it never revokes same-owner team bots.
-                            {
+                            // Preserve author-before-filter ordering for modes that do not
+                            // need unmentioned reply classification. Mentions/config modes
+                            // classify first, then apply the same author gate below.
+                            if !matches!(
+                                config.subscribe_mode,
+                                SubscribeMode::Mentions | SubscribeMode::Config
+                            ) {
                                 let author = buzz_event.event.pubkey.to_hex();
-                                // DM hardening: resolve channel type (fail-closed
-                                // to DM) so allowlist/anyone modes cannot be
-                                // exercised by non-owner authors inside DMs.
                                 let is_dm =
                                     is_dm_channel(buzz_event.channel_id, &ctx.channel_info).await;
                                 let allowed = author_allowed(
@@ -2242,14 +2583,204 @@ async fn tokio_main() -> Result<()> {
                                 }
                             }
 
-                            let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
+                            // In mentions mode, explicit matches retain the normal inline
+                            // author gate. Unmentioned reply candidates move their complete
+                            // parent + channel + author decision to a bounded background task.
+                            let ordinary_match = filter::match_event(
+                                &buzz_event.event,
+                                buzz_event.channel_id,
+                                &rules,
+                                &pubkey_hex,
+                            )
+                            .await;
+                            let matched = if config.subscribe_mode == SubscribeMode::Config
+                                && direct_reply_verified
+                            {
+                                // A verified reply must traverse the ordered rules
+                                // with only the mention predicate waived.
+                                filter::match_verified_reply(
+                                    &buzz_event.event,
+                                    buzz_event.channel_id,
+                                    &rules,
+                                    &pubkey_hex,
+                                )
+                                .await
+                            } else if config.subscribe_mode == SubscribeMode::Config
+                                && validated_generation.is_none()
+                                && direct_reply_parent_id(&buzz_event.event).is_some()
+                            {
+                                let verified_candidate = match filter::match_verified_reply_outcome(
+                                    &buzz_event.event,
+                                    buzz_event.channel_id,
+                                    &rules,
+                                    &pubkey_hex,
+                                )
+                                .await
+                                {
+                                    filter::MatchOutcome::Matched(matched) => Some(matched),
+                                    filter::MatchOutcome::NoMatch => None,
+                                    filter::MatchOutcome::FailedClosed => {
+                                        tracing::debug!(
+                                            channel_id = %buzz_event.channel_id,
+                                            "verified reply candidate rule evaluation failed closed"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let parent_known_other = direct_reply_parent_id(&buzz_event.event)
+                                    .and_then(|parent| {
+                                        recent_reply_parents.lock().ok().and_then(|cache| {
+                                            cache.is_agent_parent(&parent, buzz_event.channel_id)
+                                        })
+                                    })
+                                    == Some(false);
+                                if reply_candidate_requires_classification(
+                                    verified_candidate.as_ref(),
+                                    ordinary_match.as_ref(),
+                                    parent_known_other,
+                                    validated_generation.is_some(),
+                                ) {
+                                    // Force the bounded classifier. Its result returns
+                                    // as either verified or an ordinary fallback and
+                                    // cannot be scheduled a second time.
+                                    None
+                                } else {
+                                    ordinary_match
+                                }
+                            } else {
+                                ordinary_match
+                            };
                             let prompt_tag = match matched {
                                 Some(m) => m.prompt_tag,
+                                None
+                                    if matches!(
+                                        config.subscribe_mode,
+                                        SubscribeMode::Mentions | SubscribeMode::Config
+                                    ) =>
+                                {
+                                    if direct_reply_verified {
+                                        if config.subscribe_mode == SubscribeMode::Config {
+                                            tracing::debug!(
+                                                channel_id = %buzz_event.channel_id,
+                                                "verified reply matched no configured rule — dropping"
+                                            );
+                                            continue;
+                                        }
+                                        "@reply".to_string()
+                                    } else {
+                                        if classified_ordinary_fallback_is_terminal(
+                                            validated_generation,
+                                            direct_reply_verified,
+                                        ) {
+                                            tracing::debug!(
+                                                channel_id = %buzz_event.channel_id,
+                                                "classified ordinary fallback matched no rule — dropping"
+                                            );
+                                            continue;
+                                        }
+                                        let Some(parent_hex) =
+                                            direct_reply_parent_id(&buzz_event.event)
+                                        else {
+                                            tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
+                                            continue;
+                                        };
+                                        let cached_parent = recent_reply_parents
+                                            .lock()
+                                            .ok()
+                                            .and_then(|cache| {
+                                                cache.is_agent_parent(
+                                                    &parent_hex,
+                                                    buzz_event.channel_id,
+                                                )
+                                            });
+                                        let parent_verified_from_cache = match cached_parent {
+                                                Some(true) => true,
+                                                Some(false) => {
+                                                    tracing::debug!(
+                                                        channel_id = %buzz_event.channel_id,
+                                                        parent_event_id = %parent_hex,
+                                                        "reply parent is locally known and not this agent — dropping"
+                                                    );
+                                                    continue;
+                                                }
+                                                None => false,
+                                        };
+                                        let Some(subscription_generation) =
+                                            subscription_generations
+                                                .get(&buzz_event.channel_id)
+                                                .copied()
+                                        else {
+                                            tracing::debug!(
+                                                channel_id = %buzz_event.channel_id,
+                                                "reply candidate has no active subscription generation — dropping"
+                                            );
+                                            continue;
+                                        };
+                                        let scheduled = schedule_direct_reply_validation(
+                                            buzz_event.clone(),
+                                            parent_hex.clone(),
+                                            parent_verified_from_cache,
+                                            subscription_generation,
+                                            ReplyValidationContext {
+                                                agent_pubkey_hex: pubkey_hex.clone(),
+                                                rest_client: ctx.rest_client.clone(),
+                                                channel_info: ctx.channel_info.clone(),
+                                                respond_to: config.respond_to.clone(),
+                                                allowlist: config.respond_to_allowlist.clone(),
+                                                owner_cache: owner_cache.clone(),
+                                                permits: reply_lookup_permits.clone(),
+                                                verification_permits: event_verification_permits
+                                                    .clone(),
+                                                validated_tx: validated_reply_tx.clone(),
+                                            },
+                                        );
+                                        if !scheduled {
+                                            tracing::warn!(
+                                                channel_id = %buzz_event.channel_id,
+                                                parent_event_id = %parent_hex,
+                                                "reply validation capacity exhausted — dropping fail-closed"
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                }
                                 None => {
                                     tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
                                     continue;
                                 }
                             };
+
+                            // Background reply validation already performed the same
+                            // channel and author policy. Explicit matches in mention/config
+                            // modes take the normal inline path after routing classification.
+                            if matches!(
+                                config.subscribe_mode,
+                                SubscribeMode::Mentions | SubscribeMode::Config
+                            ) && !direct_reply_verified
+                            {
+                                let author = buzz_event.event.pubkey.to_hex();
+                                let is_dm =
+                                    is_dm_channel(buzz_event.channel_id, &ctx.channel_info).await;
+                                let allowed = author_allowed(
+                                    &config.respond_to,
+                                    &config.respond_to_allowlist,
+                                    &author,
+                                    is_dm,
+                                    &owner_cache,
+                                    &ctx.rest_client,
+                                )
+                                .await;
+                                if !allowed {
+                                    tracing::debug!(
+                                        channel_id = %buzz_event.channel_id,
+                                        author = %buzz_event.event.pubkey.to_hex(),
+                                        mode = %config.respond_to,
+                                        is_dm,
+                                        "inbound author gate — dropping event"
+                                    );
+                                    continue;
+                                }
+                            }
                             // Capture author pubkey before queue.push() moves
                             // buzz_event.event (needed for mode gate below).
                             let author_hex = buzz_event.event.pubkey.to_hex();
@@ -4886,6 +5417,731 @@ mod author_gate_tests {
             is_dm_channel(Uuid::new_v4(), &resolver(HashMap::new())).await,
             "an unresolvable channel type must be treated as a DM"
         );
+    }
+}
+
+#[cfg(test)]
+mod reply_routing_tests {
+    use super::*;
+    use nostr::{EventBuilder, Kind, Tag};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn channel_message(
+        keys: &nostr::Keys,
+        channel_id: Uuid,
+        content: &str,
+        reply_to: Option<nostr::EventId>,
+    ) -> nostr::Event {
+        let mut tags = vec![Tag::parse(["h", &channel_id.to_string()]).unwrap()];
+        if let Some(parent) = reply_to {
+            tags.push(Tag::parse(["e", &parent.to_hex(), "", "reply"]).unwrap());
+        }
+        EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), content)
+            .tags(tags)
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    async fn rest_client_returning_after(
+        events: serde_json::Value,
+        delay: Duration,
+    ) -> (relay::RestClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let body = events.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept query");
+            let mut request = vec![0; 8192];
+            let _ = socket.read(&mut request).await;
+            tokio::time::sleep(delay).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (
+            relay::RestClient {
+                http: reqwest::Client::new(),
+                base_url,
+                keys: nostr::Keys::generate(),
+                auth_tag_json: None,
+            },
+            server,
+        )
+    }
+
+    async fn rest_client_returning(
+        events: serde_json::Value,
+    ) -> (relay::RestClient, tokio::task::JoinHandle<()>) {
+        rest_client_returning_after(events, Duration::ZERO).await
+    }
+
+    fn dummy_rest_client() -> relay::RestClient {
+        relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:0".into(),
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_validation_is_forced_after_bounded_relay_window() {
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let event = relay::BuzzEvent {
+            channel_id,
+            event: channel_message(&keys, channel_id, "reply", None),
+        };
+        let generation = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(ValidatedReply {
+            event,
+            subscription_generation: generation,
+            parent_verified: true,
+        })
+        .await
+        .unwrap();
+
+        assert!(take_ready_validated_reply_after_budget(
+            MAX_RELAY_EVENTS_BEFORE_VALIDATED_REPLY - 1,
+            &mut rx,
+        )
+        .is_none());
+        let selected = take_ready_validated_reply_after_budget(
+            MAX_RELAY_EVENTS_BEFORE_VALIDATED_REPLY,
+            &mut rx,
+        )
+        .expect("ready validation must be forced at the relay-drain bound");
+        assert_eq!(selected.subscription_generation, generation);
+    }
+
+    #[tokio::test]
+    async fn direct_reply_to_agent_is_routable_without_mention() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let parent = channel_message(&agent, channel_id, "agent answer", None);
+        let reply = channel_message(&human, channel_id, "follow-up", Some(parent.id));
+        let (rest, server) = rest_client_returning(serde_json::json!([parent])).await;
+
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+        assert!(
+            lookup_direct_reply_parent(
+                &parent_hex,
+                channel_id,
+                &agent.public_key().to_hex(),
+                &rest,
+                Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS)),
+            )
+            .await
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_to_another_author_is_not_routable() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let parent = channel_message(&human, channel_id, "human message", None);
+        let reply = channel_message(&human, channel_id, "human follow-up", Some(parent.id));
+        let (rest, server) = rest_client_returning(serde_json::json!([parent])).await;
+
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+        assert!(
+            !lookup_direct_reply_parent(
+                &parent_hex,
+                channel_id,
+                &agent.public_key().to_hex(),
+                &rest,
+                Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS)),
+            )
+            .await
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rest_fallback_rejects_returned_event_id_mismatch() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let requested_parent = channel_message(&agent, channel_id, "requested", None);
+        let returned_parent = channel_message(&agent, channel_id, "different", None);
+        let reply = channel_message(&human, channel_id, "follow-up", Some(requested_parent.id));
+        let (rest, server) = rest_client_returning(serde_json::json!([returned_parent])).await;
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+
+        assert!(
+            !lookup_direct_reply_parent(
+                &parent_hex,
+                channel_id,
+                &agent.public_key().to_hex(),
+                &rest,
+                Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS)),
+            )
+            .await
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn recent_parent_cache_short_circuits_by_author_and_channel() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let other_channel = Uuid::new_v4();
+        let agent_parent = channel_message(&agent, channel_id, "agent", None);
+        let human_parent = channel_message(&human, channel_id, "human", None);
+        let mut cache = RecentReplyParents::default();
+
+        cache.insert_verified(agent_parent.id.to_hex(), channel_id);
+
+        assert_eq!(
+            cache.is_agent_parent(&agent_parent.id.to_hex(), channel_id),
+            Some(true)
+        );
+        assert_eq!(
+            cache.is_agent_parent(&human_parent.id.to_hex(), channel_id),
+            None
+        );
+        assert_eq!(
+            cache.is_agent_parent(&agent_parent.id.to_hex(), other_channel),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_parent_observation_verifies_off_loop_and_ignores_other_authors() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let agent_parent = channel_message(&agent, channel_id, "agent", None);
+        let human_parent = channel_message(&human, channel_id, "human", None);
+        let cache = Arc::new(std::sync::Mutex::new(RecentReplyParents::default()));
+        let verification_permits = Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS));
+
+        schedule_recent_parent_observation(
+            &human_parent,
+            channel_id,
+            &agent.public_key().to_hex(),
+            cache.clone(),
+            verification_permits.clone(),
+        );
+        schedule_recent_parent_observation(
+            &agent_parent,
+            channel_id,
+            &agent.public_key().to_hex(),
+            cache.clone(),
+            verification_permits,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cache
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .contains_key(&agent_parent.id.to_hex())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("agent parent verification should complete");
+        let cache = cache.lock().unwrap();
+        assert!(!cache.entries.contains_key(&human_parent.id.to_hex()));
+    }
+
+    #[test]
+    fn recent_parent_cache_capacity_evicts_oldest_entry() {
+        let channel_id = Uuid::new_v4();
+        let mut cache = RecentReplyParents::default();
+        for index in 0..RECENT_REPLY_PARENT_CAPACITY {
+            let id = format!("cached-{index}");
+            cache.order.push_back(id.clone());
+            cache.entries.insert(id, channel_id);
+        }
+        let agent = nostr::Keys::generate();
+        let newest = channel_message(&agent, channel_id, "newest", None);
+
+        cache.insert_verified(newest.id.to_hex(), channel_id);
+
+        assert_eq!(cache.entries.len(), RECENT_REPLY_PARENT_CAPACITY);
+        assert!(!cache.entries.contains_key("cached-0"));
+        assert!(cache.entries.contains_key(&newest.id.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn bounded_verification_rejects_invalid_signature() {
+        let agent = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let parent = channel_message(&agent, channel_id, "agent", None);
+        let mut value = serde_json::to_value(&parent).unwrap();
+        value["content"] = serde_json::json!("tampered");
+        let tampered = serde_json::from_value::<nostr::Event>(value).unwrap();
+        assert!(
+            !verify_event_bounded(
+                tampered,
+                Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS)),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_verification_capacity_exhaustion_fails_closed() {
+        let event = channel_message(&nostr::Keys::generate(), Uuid::new_v4(), "event", None);
+        assert!(!verify_event_bounded(event, Arc::new(Semaphore::new(0))).await);
+    }
+
+    #[test]
+    fn earlier_verified_rule_defers_first_arrival_but_not_fallback() {
+        let verified = filter::MatchedRule {
+            rule_index: 0,
+            prompt_tag: "strict".to_string(),
+        };
+        let ordinary = filter::MatchedRule {
+            rule_index: 1,
+            prompt_tag: "open".to_string(),
+        };
+
+        assert!(reply_candidate_requires_classification(
+            Some(&verified),
+            Some(&ordinary),
+            false,
+            false,
+        ));
+        assert!(!reply_candidate_requires_classification(
+            Some(&verified),
+            Some(&ordinary),
+            false,
+            true,
+        ));
+        assert!(!reply_candidate_requires_classification(
+            Some(&verified),
+            Some(&ordinary),
+            true,
+            false,
+        ));
+        let generation = Some(Uuid::new_v4());
+        assert!(classified_ordinary_fallback_is_terminal(generation, false));
+        assert!(!classified_ordinary_fallback_is_terminal(None, false));
+        assert!(!classified_ordinary_fallback_is_terminal(generation, true));
+    }
+
+    #[test]
+    fn stale_subscription_generation_is_rejected_after_readd() {
+        let channel_id = Uuid::new_v4();
+        let old_generation = Uuid::new_v4();
+        let new_generation = Uuid::new_v4();
+        let subscribed = HashSet::from([channel_id]);
+        let generations = HashMap::from([(channel_id, new_generation)]);
+
+        assert!(!validated_reply_generation_is_current(
+            channel_id,
+            Some(old_generation),
+            &subscribed,
+            &generations,
+        ));
+        assert!(validated_reply_generation_is_current(
+            channel_id,
+            Some(new_generation),
+            &subscribed,
+            &generations,
+        ));
+    }
+
+    #[tokio::test]
+    async fn rest_fallback_rejects_cross_channel_parent() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let other_channel = Uuid::new_v4();
+        let parent = channel_message(&agent, other_channel, "agent answer", None);
+        let reply = channel_message(&human, channel_id, "follow-up", Some(parent.id));
+        let (rest, server) = rest_client_returning(serde_json::json!([parent])).await;
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+
+        assert!(
+            !lookup_direct_reply_parent(
+                &parent_hex,
+                channel_id,
+                &agent.public_key().to_hex(),
+                &rest,
+                Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS)),
+            )
+            .await
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rest_fallback_rejects_invalid_signature() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let parent = channel_message(&agent, channel_id, "agent answer", None);
+        let reply = channel_message(&human, channel_id, "follow-up", Some(parent.id));
+        let mut value = serde_json::to_value(&parent).unwrap();
+        value["content"] = serde_json::json!("tampered");
+        let (rest, server) = rest_client_returning(serde_json::json!([value])).await;
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+
+        assert!(
+            !lookup_direct_reply_parent(
+                &parent_hex,
+                channel_id,
+                &agent.public_key().to_hex(),
+                &rest,
+                Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS)),
+            )
+            .await
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_parent_routes_without_rest() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let parent = channel_message(&agent, channel_id, "agent answer", None);
+        let reply = channel_message(&human, channel_id, "follow-up", Some(parent.id));
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+        let rest = dummy_rest_client();
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "stream".into(),
+                    channel_type: "stream".into(),
+                },
+            )]),
+            rest.clone(),
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        let subscription_generation = Uuid::new_v4();
+
+        assert!(schedule_direct_reply_validation(
+            relay::BuzzEvent {
+                channel_id,
+                event: reply.clone(),
+            },
+            parent_hex,
+            true,
+            subscription_generation,
+            ReplyValidationContext {
+                agent_pubkey_hex: agent.public_key().to_hex(),
+                rest_client: rest,
+                channel_info,
+                respond_to: RespondTo::Anyone,
+                allowlist: HashSet::new(),
+                owner_cache: Arc::new(OwnerCache::new(None)),
+                permits: Arc::new(Semaphore::new(1)),
+                verification_permits: Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS,)),
+                validated_tx: tx,
+            },
+        ));
+        let validated = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("cache-hit validation must not wait on REST")
+            .expect("cache-hit reply should be accepted");
+        assert_eq!(validated.event.event.id, reply.id);
+        assert_eq!(validated.subscription_generation, subscription_generation);
+        assert!(validated.parent_verified);
+    }
+
+    #[tokio::test]
+    async fn non_agent_parent_returns_one_ordinary_fallback_classification() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let missing_parent = nostr::EventId::all_zeros();
+        let reply = channel_message(&human, channel_id, "open-rule reply", Some(missing_parent));
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+        let (rest, server) = rest_client_returning(serde_json::json!([])).await;
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "stream".into(),
+                    channel_type: "stream".into(),
+                },
+            )]),
+            rest.clone(),
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        let generation = Uuid::new_v4();
+
+        assert!(schedule_direct_reply_validation(
+            relay::BuzzEvent {
+                channel_id,
+                event: reply.clone()
+            },
+            parent_hex,
+            false,
+            generation,
+            ReplyValidationContext {
+                agent_pubkey_hex: agent.public_key().to_hex(),
+                rest_client: rest,
+                channel_info,
+                respond_to: RespondTo::Anyone,
+                allowlist: HashSet::new(),
+                owner_cache: Arc::new(OwnerCache::new(None)),
+                permits: Arc::new(Semaphore::new(1)),
+                verification_permits: Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS)),
+                validated_tx: tx,
+            },
+        ));
+        let classified = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("classification should complete")
+            .expect("valid child should return an ordinary fallback");
+        assert_eq!(classified.event.event.id, reply.id);
+        assert_eq!(classified.subscription_generation, generation);
+        assert!(!classified.parent_verified);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_validation_rejects_invalid_reply_signature() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let parent = channel_message(&agent, channel_id, "agent answer", None);
+        let reply = channel_message(&human, channel_id, "follow-up", Some(parent.id));
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+        let mut value = serde_json::to_value(reply).unwrap();
+        value["content"] = serde_json::json!("tampered");
+        let tampered = serde_json::from_value::<nostr::Event>(value).unwrap();
+        let rest = dummy_rest_client();
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "stream".into(),
+                    channel_type: "stream".into(),
+                },
+            )]),
+            rest.clone(),
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert!(schedule_direct_reply_validation(
+            relay::BuzzEvent {
+                channel_id,
+                event: tampered,
+            },
+            parent_hex,
+            true,
+            Uuid::new_v4(),
+            ReplyValidationContext {
+                agent_pubkey_hex: agent.public_key().to_hex(),
+                rest_client: rest,
+                channel_info,
+                respond_to: RespondTo::Anyone,
+                allowlist: HashSet::new(),
+                owner_cache: Arc::new(OwnerCache::new(None)),
+                permits: Arc::new(Semaphore::new(1)),
+                verification_permits: Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS,)),
+                validated_tx: tx,
+            },
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("signature validation should finish")
+                .is_none(),
+            "invalid reply signature must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_validation_capacity_exhaustion_drops_fail_closed() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let parent = channel_message(&agent, channel_id, "agent answer", None);
+        let reply = channel_message(&human, channel_id, "follow-up", Some(parent.id));
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+        let rest = dummy_rest_client();
+        let channel_info = pool::ChannelInfoResolver::new(HashMap::new(), rest.clone());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert!(!schedule_direct_reply_validation(
+            relay::BuzzEvent {
+                channel_id,
+                event: reply,
+            },
+            parent_hex,
+            false,
+            Uuid::new_v4(),
+            ReplyValidationContext {
+                agent_pubkey_hex: agent.public_key().to_hex(),
+                rest_client: rest,
+                channel_info,
+                respond_to: RespondTo::Anyone,
+                allowlist: HashSet::new(),
+                owner_cache: Arc::new(OwnerCache::new(None)),
+                permits: Arc::new(Semaphore::new(0)),
+                verification_permits: Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS,)),
+                validated_tx: tx,
+            },
+        ));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn slow_author_lookup_does_not_block_a_following_explicit_mention() {
+        let agent = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let parent = channel_message(&agent, channel_id, "agent answer", None);
+        let reply = channel_message(&human, channel_id, "follow-up", Some(parent.id));
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+        let (rest, server) =
+            rest_client_returning_after(serde_json::json!([]), Duration::from_millis(250)).await;
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "stream".into(),
+                    channel_type: "stream".into(),
+                },
+            )]),
+            rest.clone(),
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert!(schedule_direct_reply_validation(
+            relay::BuzzEvent {
+                channel_id,
+                event: reply,
+            },
+            parent_hex,
+            true,
+            Uuid::new_v4(),
+            ReplyValidationContext {
+                agent_pubkey_hex: agent.public_key().to_hex(),
+                rest_client: rest,
+                channel_info,
+                respond_to: RespondTo::OwnerOnly,
+                allowlist: HashSet::new(),
+                owner_cache: Arc::new(OwnerCache::new(Some(owner.public_key().to_hex()))),
+                permits: Arc::new(Semaphore::new(1)),
+                verification_permits: Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS,)),
+                validated_tx: tx,
+            },
+        ));
+
+        let (mention_tx, mut mention_rx) = mpsc::channel(1);
+        mention_tx.send("@agent follow-up").await.unwrap();
+        tokio::select! {
+            mention = mention_rx.recv() => {
+                assert_eq!(mention, Some("@agent follow-up"));
+            }
+            validated = rx.recv() => {
+                panic!("slow author validation completed before explicit mention: {validated:?}");
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("author validation should finish")
+                .is_none(),
+            "unverified author must fail closed"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_rest_fallback_does_not_block_a_following_explicit_mention() {
+        let agent = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let parent = channel_message(&agent, channel_id, "agent answer", None);
+        let reply = channel_message(&human, channel_id, "follow-up", Some(parent.id));
+        let parent_hex = direct_reply_parent_id(&reply).unwrap();
+        let (rest, server) =
+            rest_client_returning_after(serde_json::json!([parent]), Duration::from_millis(250))
+                .await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let permits = Arc::new(Semaphore::new(1));
+        let buzz_event = relay::BuzzEvent {
+            channel_id,
+            event: reply,
+        };
+
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "stream".into(),
+                    channel_type: "stream".into(),
+                },
+            )]),
+            rest.clone(),
+        );
+        let started = std::time::Instant::now();
+        assert!(schedule_direct_reply_validation(
+            buzz_event.clone(),
+            parent_hex,
+            false,
+            Uuid::new_v4(),
+            ReplyValidationContext {
+                agent_pubkey_hex: agent.public_key().to_hex(),
+                rest_client: rest,
+                channel_info,
+                respond_to: RespondTo::Anyone,
+                allowlist: HashSet::new(),
+                owner_cache: Arc::new(OwnerCache::new(None)),
+                permits,
+                verification_permits: Arc::new(Semaphore::new(MAX_PENDING_EVENT_VERIFICATIONS,)),
+                validated_tx: tx,
+            },
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "scheduling must not await the REST fallback"
+        );
+
+        // Model the main loop receiving a subsequent explicit mention while
+        // the cache-miss validation is still waiting on REST. The mention-side
+        // event is immediately available and must win before validation.
+        let (mention_tx, mut mention_rx) = mpsc::channel(1);
+        mention_tx.send("@agent follow-up").await.unwrap();
+        tokio::select! {
+            mention = mention_rx.recv() => {
+                assert_eq!(mention, Some("@agent follow-up"));
+            }
+            validated = rx.recv() => {
+                panic!("slow parent validation completed before explicit mention: {validated:?}");
+            }
+        }
+
+        let validated = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("validation should finish")
+            .expect("validated event should be returned");
+        assert_eq!(validated.event.event.id, buzz_event.event.id);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn top_level_unmentioned_message_is_not_routable() {
+        let human = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let message = channel_message(&human, channel_id, "ordinary chatter", None);
+        assert!(direct_reply_parent_id(&message).is_none());
     }
 }
 

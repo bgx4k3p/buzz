@@ -155,6 +155,13 @@ pub struct MatchedRule {
     pub prompt_tag: String,
 }
 
+#[derive(Debug, Clone)]
+pub enum MatchOutcome {
+    Matched(MatchedRule),
+    NoMatch,
+    FailedClosed,
+}
+
 /// Maximum expression length accepted by `evaluate_filter`.
 ///
 /// Bounds worst-case O(2^n) evaluation paths. The spawn_blocking thread cannot
@@ -371,6 +378,45 @@ pub async fn match_event(
     rules: &[SubscriptionRule],
     agent_pubkey_hex: &str,
 ) -> Option<MatchedRule> {
+    match match_event_with_mention_policy(event, channel_id, rules, agent_pubkey_hex, false).await {
+        MatchOutcome::Matched(matched) => Some(matched),
+        MatchOutcome::NoMatch | MatchOutcome::FailedClosed => None,
+    }
+}
+
+/// Match an event whose direct-reply parent has already been cryptographically
+/// verified as this agent's event in the same channel.
+///
+/// This waives only `require_mention`; channel, kind, custom-filter ordering,
+/// timeout accounting, and fail-closed behavior are identical to [`match_event`].
+pub async fn match_verified_reply(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    rules: &[SubscriptionRule],
+    agent_pubkey_hex: &str,
+) -> Option<MatchedRule> {
+    match match_verified_reply_outcome(event, channel_id, rules, agent_pubkey_hex).await {
+        MatchOutcome::Matched(matched) => Some(matched),
+        MatchOutcome::NoMatch | MatchOutcome::FailedClosed => None,
+    }
+}
+
+pub async fn match_verified_reply_outcome(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    rules: &[SubscriptionRule],
+    agent_pubkey_hex: &str,
+) -> MatchOutcome {
+    match_event_with_mention_policy(event, channel_id, rules, agent_pubkey_hex, true).await
+}
+
+async fn match_event_with_mention_policy(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    rules: &[SubscriptionRule],
+    agent_pubkey_hex: &str,
+    verified_reply: bool,
+) -> MatchOutcome {
     let filter_ctx = FilterContext::from_event(event, channel_id);
 
     for (index, rule) in rules.iter().enumerate() {
@@ -387,7 +433,7 @@ pub async fn match_event(
         // 3. Mention check — look for a `p` tag whose first element equals
         //    agent_pubkey_hex. Uses tag.as_slice() for stable, library-independent
         //    access — avoids relying on the Display impl of tag kind.
-        if rule.require_mention {
+        if rule.require_mention && !verified_reply {
             let mentioned = event.tags.iter().any(|tag| {
                 let s = tag.as_slice();
                 s.first().map(|k| k.as_str()) == Some("p")
@@ -411,7 +457,7 @@ pub async fn match_event(
                      failing closed (no match for any rule)"
                 );
                 // Fail-closed: disabled rule → no match for this event.
-                return None;
+                return MatchOutcome::FailedClosed;
             }
 
             match evaluate_filter(expr, &filter_ctx, rule.compiled_filter.clone()).await {
@@ -432,7 +478,7 @@ pub async fn match_event(
                         "filter expression timed out; failing closed (no match for any rule)"
                     );
                     // Fail-closed: timeout → no match, not next rule.
-                    return None;
+                    return MatchOutcome::FailedClosed;
                 }
                 Err(e) => {
                     warn!(
@@ -442,7 +488,7 @@ pub async fn match_event(
                         "filter expression error; failing closed (no match for any rule)"
                     );
                     // Fail-closed: any error → no match, not next rule.
-                    return None;
+                    return MatchOutcome::FailedClosed;
                 }
             }
         }
@@ -450,13 +496,13 @@ pub async fn match_event(
         // All checks passed — this rule wins.
         let prompt_tag = rule.prompt_tag.clone().unwrap_or_else(|| rule.name.clone());
 
-        return Some(MatchedRule {
+        return MatchOutcome::Matched(MatchedRule {
             rule_index: index,
             prompt_tag,
         });
     }
 
-    None
+    MatchOutcome::NoMatch
 }
 
 #[cfg(test)]
@@ -664,6 +710,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_reply_waives_only_mention_requirement() {
+        let channel_id = any_channel();
+        let other_channel = any_channel();
+        let event = make_event(9, "follow-up");
+        let author_filter = format!(r#"author == "{}""#, event.pubkey.to_hex());
+        let rules = vec![make_rule(
+            "shared-replies",
+            ChannelScope::List(vec![channel_id.to_string()]),
+            vec![9],
+            true,
+            Some(&author_filter),
+            Some("@reply"),
+        )];
+
+        assert!(match_event(&event, channel_id, &rules, "agent")
+            .await
+            .is_none());
+        let matched = match_verified_reply(&event, channel_id, &rules, "agent")
+            .await
+            .expect("verified reply should waive only the mention predicate");
+        assert_eq!(matched.prompt_tag, "@reply");
+        assert!(match_verified_reply(&event, other_channel, &rules, "agent")
+            .await
+            .is_none());
+
+        let wrong_kind = make_event(1, "follow-up");
+        assert!(
+            match_verified_reply(&wrong_kind, channel_id, &rules, "agent")
+                .await
+                .is_none()
+        );
+
+        let rejecting_rules = vec![make_rule(
+            "rejecting-filter",
+            ChannelScope::List(vec![channel_id.to_string()]),
+            vec![9],
+            true,
+            Some("false"),
+            None,
+        )];
+        assert!(
+            match_verified_reply(&event, channel_id, &rejecting_rules, "agent")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_reply_rule_failure_cannot_fall_through_to_open_rule() {
+        let channel_id = any_channel();
+        let event = make_event(9, "follow-up");
+        let strict = make_rule(
+            "strict-disabled",
+            ChannelScope::All("all".into()),
+            vec![9],
+            true,
+            Some("true"),
+            Some("strict"),
+        );
+        strict
+            .consecutive_timeouts
+            .store(MAX_CONSECUTIVE_TIMEOUTS, Ordering::Relaxed);
+        let rules = vec![
+            strict,
+            make_rule(
+                "later-open",
+                ChannelScope::All("all".into()),
+                vec![9],
+                false,
+                None,
+                Some("open"),
+            ),
+        ];
+
+        assert_eq!(
+            match_event(&event, channel_id, &rules, "agent")
+                .await
+                .expect("ordinary matcher skips the unmentioned strict rule")
+                .prompt_tag,
+            "open"
+        );
+        assert!(matches!(
+            match_verified_reply_outcome(&event, channel_id, &rules, "agent").await,
+            MatchOutcome::FailedClosed
+        ));
+    }
+
+    #[tokio::test]
     async fn test_match_event_no_match() {
         let event = make_event(1, "hello");
         let channel_id = any_channel();
@@ -759,6 +893,45 @@ mod tests {
         assert!(
             result.is_none(),
             "filter error must fail closed, not fall through to next rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_reply_preserves_first_match_order_across_mention_policies() {
+        let channel_id = any_channel();
+        let event = make_event(9, "follow-up");
+        let rules = vec![
+            make_rule(
+                "first-strict",
+                ChannelScope::All("all".into()),
+                vec![9],
+                true,
+                None,
+                Some("first"),
+            ),
+            make_rule(
+                "later-open",
+                ChannelScope::All("all".into()),
+                vec![9],
+                false,
+                None,
+                Some("later"),
+            ),
+        ];
+
+        assert_eq!(
+            match_event(&event, channel_id, &rules, "agent")
+                .await
+                .expect("ordinary matching should reach the later open rule")
+                .prompt_tag,
+            "later"
+        );
+        assert_eq!(
+            match_verified_reply(&event, channel_id, &rules, "agent")
+                .await
+                .expect("verified matching should waive mention on the first rule")
+                .prompt_tag,
+            "first"
         );
     }
 
